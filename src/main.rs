@@ -161,7 +161,7 @@ fn schedule(
                         }
                     }
                     store
-                        .reconcile(&scan.modules)
+                        .reconcile(&scan)
                         .context("reconcile module schedules")?;
                     current = scan;
                     last_scan_error = None;
@@ -183,7 +183,7 @@ fn schedule(
         if worker.is_none()
             && last_scan_error.is_none()
             && !stopping.load(Ordering::Relaxed)
-            && let Some(due) = store.due(now.timestamp())?
+            && let Some(due) = store.due(now.timestamp(), &current)?
         {
             let job = current
                 .modules
@@ -194,6 +194,15 @@ fn schedule(
                 "revision mismatch for {:?}",
                 due.name
             );
+            // A saved occurrence may have been calculated by an older cron parser.
+            if !job.schedule.matches_timestamp(due.at)? {
+                let saved = chrono::DateTime::from_timestamp(due.at, 0)
+                    .context("invalid saved cron timestamp")?;
+                store
+                    .claim(&due, job.schedule.next_after(saved)?)
+                    .context("correct saved cron occurrence")?;
+                continue;
+            }
             let next = job.schedule.next_after(now)?;
             store.claim(&due, next).context("persist dispatch claim")?;
             let name = due.name;

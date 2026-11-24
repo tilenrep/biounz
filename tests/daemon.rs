@@ -112,3 +112,80 @@ fn added_and_edited_modules_run_but_an_unchanged_module_stays_consumed() -> Resu
     assert_eq!(fs::read_to_string(ready)?, "started\n");
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn unreadable_module_does_not_block_other_jobs() -> Result<()> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir()?;
+    let modules = root.path().join("modules");
+    fs::create_dir(&modules)?;
+    deploy(&modules, "blocked.rhai", "blocked", "ran")?;
+    deploy(&modules, "ready.rhai", "ready", "ran")?;
+    let blocked = modules.join("blocked.rhai");
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000))?;
+    match fs::File::open(&blocked) {
+        Ok(_) => return Ok(()), // A privileged test runner can bypass the mode bits.
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut daemon = Daemon::start(root.path())?;
+    daemon.wait_for(&root.path().join("ready"), "ran\n")?;
+    assert!(!root.path().join("blocked").exists());
+
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o600))?;
+    daemon.wait_for(&root.path().join("blocked"), "ran\n")?;
+    daemon.stop()
+}
+
+#[test]
+fn restart_corrects_a_saved_cron_occurrence_that_no_longer_matches() -> Result<()> {
+    use chrono::{DateTime, Datelike, Timelike, Utc};
+    use rusqlite::{Connection, params};
+
+    let root = tempfile::tempdir()?;
+    let modules = root.path().join("modules");
+    fs::create_dir(&modules)?;
+    let ready = root.path().join("ready");
+    deploy(&modules, "ready.rhai", "ready", "started")?;
+    let now = Utc::now().timestamp();
+    let stale = DateTime::from_timestamp(now.div_euclid(60) * 60 - 60, 0).unwrap();
+    let day = if stale.day() <= 14 { 28 } else { 14 };
+    let source = format!(
+        "// schedule: {} {} {day} * */1\nappend_text(\"../unexpected\", \"ran\");",
+        stale.minute(),
+        stale.hour()
+    );
+    fs::write(modules.join("job.rhai"), source)?;
+    let mut daemon = Daemon::start(root.path())?;
+    daemon.wait_for(&ready, "started\n")?;
+    daemon.stop()?;
+
+    let db = Connection::open(root.path().join(".moduled/schedule.sqlite3"))?;
+    assert_eq!(
+        db.execute(
+            "UPDATE schedules SET next_at = ?1 WHERE name = 'job.rhai'",
+            params![stale.timestamp()],
+        )?,
+        1
+    );
+    drop(db);
+    deploy(&modules, "ready.rhai", "ready", "restarted")?;
+    let mut daemon = Daemon::start(root.path())?;
+    daemon.wait_for(&ready, "started\nrestarted\n")?;
+    daemon.stop()?;
+
+    assert!(!root.path().join("unexpected").exists());
+    let db = Connection::open(root.path().join(".moduled/schedule.sqlite3"))?;
+    let next: i64 = db.query_row(
+        "SELECT next_at FROM schedules WHERE name = 'job.rhai'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(next > now);
+    assert_eq!(DateTime::from_timestamp(next, 0).unwrap().day(), day);
+    Ok(())
+}
