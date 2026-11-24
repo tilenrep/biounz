@@ -40,9 +40,11 @@ append_text("runs.log", "weekly job ran\n");
 ```
 
 - **`// schedule: now`** — runs when first seen and again when the file contents change. Touching the file or restarting the daemon does not rerun an unchanged script. If the daemon observes removal or invalid schedule metadata, a subsequent valid file is treated as newly added.
-- **`// schedule: <minute> <hour> <day-of-month> <month> <day-of-week>`** — five-field cron syntax in **UTC**. A new or edited cron module starts at the next match. Missed occurrences while the daemon is offline or busy are combined into one catch-up run.
+- **`// schedule: <minute> <hour> <day-of-month> <month> <day-of-week>`** — five-field cron syntax in **UTC**. Standard expressions follow Cronie's day rule: if either day field starts with `*` (including steps such as `*/2`), both day fields must match. Otherwise, either day field can match. A new or edited cron module starts at the next match. Missed occurrences while the daemon is offline or busy are combined into one catch-up run.
 
 The daemon ignores dot-prefixed files, symlinks, and subdirectories. Save changes to a temporary file and rename it into place to avoid partial reads. Removing a module cancels future runs, not a run already dispatched. The watcher also rescans periodically in case it misses events.
+
+If a script cannot be read, the daemon skips that script and keeps its last known schedule. Other scripts continue to run. Once the file is readable again, an unchanged script resumes from its saved state.
 
 ### Host functions
 

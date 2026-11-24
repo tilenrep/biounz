@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -41,10 +41,24 @@ impl Schedule {
         match directive.context("missing `// schedule: ...` in the file header")? {
             "now" => Ok(Self::Now),
             expression => {
-                ensure!(
-                    expression.split_whitespace().count() == 5,
-                    "expected `now` or five cron fields: minute hour day-of-month month day-of-week"
-                );
+                let fields: Vec<_> = expression.split_whitespace().collect();
+                let [minute, hour, day, month, weekday] = fields.as_slice() else {
+                    anyhow::bail!(
+                        "expected `now` or five cron fields: minute hour day-of-month month day-of-week"
+                    );
+                };
+                // Cronie treats day fields starting with `*` as AND matches.
+                // Croner does this for a bare `*`, but needs `+` for stepped wildcards.
+                let weekday = if (day.starts_with('*') || weekday.starts_with('*'))
+                    && *day != "*"
+                    && *weekday != "*"
+                    && !weekday.starts_with('+')
+                {
+                    format!("+{weekday}")
+                } else {
+                    weekday.to_string()
+                };
+                let expression = format!("{minute} {hour} {day} {month} {weekday}");
                 Ok(Self::Cron(Box::new(
                     expression.parse().context("invalid cron schedule")?,
                 )))
@@ -60,6 +74,15 @@ impl Schedule {
                     .context("cron schedule has no reachable next occurrence")?
                     .timestamp(),
             )),
+        }
+    }
+
+    pub fn matches_timestamp(&self, at: i64) -> Result<bool> {
+        match self {
+            Self::Now => Ok(true),
+            Self::Cron(cron) => Ok(cron.is_time_matching(
+                &DateTime::from_timestamp(at, 0).context("invalid saved cron timestamp")?,
+            )?),
         }
     }
 }
@@ -82,6 +105,7 @@ impl Module {
 pub struct Scan {
     pub modules: BTreeMap<String, Module>,
     pub errors: BTreeMap<String, String>,
+    pub unreadable: BTreeSet<String>,
 }
 
 pub fn scan(directory: &Path, now: DateTime<Utc>) -> Result<Scan> {
@@ -107,7 +131,17 @@ pub fn scan(directory: &Path, now: DateTime<Utc>) -> Result<Scan> {
         if name.starts_with('.') {
             continue;
         }
-        match load_source(&path)?.and_then(|result| Module::parse(result, now)) {
+        let source = match load_source(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                scan.unreadable.insert(name.into());
+                scan.errors
+                    .insert(name.into(), format!("read module: {error}"));
+                continue;
+            }
+        };
+        match source.and_then(|result| Module::parse(result, now)) {
             Ok(module) => {
                 scan.modules.insert(name.into(), module);
             }
@@ -119,15 +153,13 @@ pub fn scan(directory: &Path, now: DateTime<Utc>) -> Result<Scan> {
     Ok(scan)
 }
 
-// An I/O failure invalidates this scan. A malformed source only disables that file.
-fn load_source(path: &Path) -> Result<Result<String>> {
+// Distinguish unreadable files from readable files with invalid content.
+fn load_source(path: &Path) -> io::Result<Result<String>> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| {
-            file.take((MAX_SOURCE_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)
-        })
-        .with_context(|| format!("read module {}", path.display()))?;
+    File::open(path).and_then(|file| {
+        file.take((MAX_SOURCE_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+    })?;
     if bytes.len() > MAX_SOURCE_BYTES {
         return Ok(Err(anyhow::anyhow!("source exceeds 1 MiB")));
     }
@@ -165,6 +197,29 @@ mod tests {
             schedule.next_after(monday).unwrap(),
             Some(monday.timestamp() + 7 * 86400)
         );
+    }
+
+    #[test]
+    fn cron_uses_both_day_fields_when_one_starts_with_a_wildcard() {
+        let start = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+        for (expression, day) in [
+            ("0 0 */2 * MON", 19),
+            ("0 0 13 * */2", 13),
+            ("0 0 */2 * */2", 11),
+            ("0 0 7 * MON", 7),
+        ] {
+            let expected = Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap();
+            let schedule = Schedule::parse(&format!("// schedule: {expression}")).unwrap();
+            assert_eq!(
+                schedule.next_after(start).unwrap(),
+                Some(expected.timestamp()),
+                "{expression}"
+            );
+            assert!(schedule.matches_timestamp(expected.timestamp()).unwrap());
+        }
+        let stale = Utc.with_ymd_and_hms(2026, 1, 7, 0, 0, 0).unwrap();
+        let schedule = Schedule::parse("// schedule: 0 0 */2 * MON").unwrap();
+        assert!(!schedule.matches_timestamp(stale.timestamp()).unwrap());
     }
 
     #[test]
