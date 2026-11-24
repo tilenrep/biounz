@@ -1,12 +1,12 @@
 # moduled
 
-`moduled` watches a directory for plain-text [Rhai](https://rhai.rs/) scripts and runs them on a schedule. The interpreter and SQLite are embedded in the daemon. **A deployed host does not need Rust, Cargo, SQLite, or a separate Rhai interpreter.** There is no dependency on system crontab.
+`moduled` watches a directory for plain-text [Rhai](https://rhai.rs/) and [Lua 5.4](https://www.lua.org/manual/5.4/) scripts and runs them on a schedule. Both interpreters and SQLite are embedded in the daemon. **A deployed host does not need Rust, Cargo, SQLite, or a separate interpreter.** There is no dependency on system crontab.
 
-Use a `moduled` executable built for your OS and CPU: Linux, macOS, or Windows. The same `.rhai` files work on each as long as they use portable operations or check the platform before calling OS-specific tools. It is not one universal binary; the executable still needs a compatible OS version and system ABI (such as glibc for a standard Linux GNU build). The optional [Native builds workflow](.github/workflows/build.yml) tests and packages builds on those three platforms when run manually.
+Use a `moduled` executable built for your OS and CPU: Linux, macOS, or Windows. The same scripts work on each as long as they use portable operations or check the platform before calling OS-specific tools. It is not one universal binary; the executable still needs a compatible OS version and system ABI (such as glibc for a standard Linux GNU build). The optional [Native builds workflow](.github/workflows/build.yml) tests and packages builds on those three platforms when run manually.
 
 ## Quick start
 
-To build from source, install Rust 1.89 or later and a native C compiler/linker (used to build bundled SQLite):
+To build from source, install Rust 1.89 or later and a native C compiler/linker (used to build bundled Lua and SQLite):
 
 ```sh
 cargo build --locked --release
@@ -30,7 +30,7 @@ The daemon prints a greeting with the host OS and architecture. Use `--modules P
 
 ## Write a script
 
-A module is a UTF-8 `.rhai` file, up to 1 MiB, with one schedule directive in the opening `//` comment block. There is no `main` function or build step: top-level statements run directly. Standalone scripts do not import other Rhai modules. Old `.rs` modules are ignored; rewrite their logic in Rhai and save them as `.rhai` files rather than just renaming them.
+A module is a UTF-8 `.rhai` or `.lua` file, up to 1 MiB, with one schedule directive in the opening line comments (`//` for Rhai, `--` for Lua). There is no `main` function or build step: top-level statements run directly. Modules are standalone and cannot import other scripts. Old `.rs` modules are ignored.
 
 ```rhai
 // schedule: 30 3 * * SUN
@@ -39,8 +39,15 @@ print("Running on " + host_os() + "/" + host_arch());
 append_text("runs.log", "weekly job ran\n");
 ```
 
-- **`// schedule: now`** — runs when first seen and again when the file contents change. Touching the file or restarting the daemon does not rerun an unchanged script. If the daemon observes removal or invalid schedule metadata, a subsequent valid file is treated as newly added.
-- **`// schedule: <minute> <hour> <day-of-month> <month> <day-of-week>`** — five-field cron syntax in **UTC**. Standard expressions follow Cronie's day rule: if either day field starts with `*` (including steps such as `*/2`), both day fields must match. Otherwise, either day field can match. A new or edited cron module starts at the next match. Missed occurrences while the daemon is offline or busy are combined into one catch-up run.
+The [Lua example](examples/hello.lua) uses the same helpers:
+
+```lua
+-- schedule: now
+print("Running Lua on " .. host_os() .. "/" .. host_arch())
+```
+
+- **`schedule: now`** — runs when first seen and again when the file contents change. Touching the file or restarting the daemon does not rerun an unchanged script. If the daemon observes removal or invalid schedule metadata, a subsequent valid file is treated as newly added.
+- **`schedule: <minute> <hour> <day-of-month> <month> <day-of-week>`** — five-field cron syntax in **UTC**. Standard expressions follow Cronie's day rule: if either day field starts with `*` (including steps such as `*/2`), both day fields must match. Otherwise, either day field can match. A new or edited cron module starts at the next match. Missed occurrences while the daemon is offline or busy are combined into one catch-up run.
 
 The daemon ignores dot-prefixed files, symlinks, and subdirectories. Save changes to a temporary file and rename it into place to avoid partial reads. Removing a module cancels future runs, not a run already dispatched. The watcher also rescans periodically in case it misses events.
 
@@ -55,13 +62,13 @@ If a script cannot be read, the daemon skips that script and keeps its last know
 | `path_exists(path)` | Return whether a path exists; surface I/O errors as script errors. |
 | `read_text(path)` | Read a UTF-8 file. |
 | `append_text(path, text)` | Append UTF-8 text, creating the file if needed. |
-| `run_command(program, args)` | Run a host executable with a string array of arguments and wait for its numeric exit code. Use an absolute executable path or a bare name on `PATH`. The daemon does not insert a shell. |
+| `run_command(program, args)` | Run a host executable with a list of strings and wait for its numeric exit code. Use `["arg"]` in Rhai or `{"arg"}` in Lua. Use an absolute executable path or a bare name on `PATH`. The daemon does not insert a shell. |
 
 Relative file paths and the working directory of child commands use the watched directory. Child commands inherit the daemon's environment, stdout, and stderr, but aren't given interactive stdin. A missing executable or a process terminated without an exit code raises a script error. A nonzero exit code is returned to the script for it to handle.
 
 ## Execution and trust
 
-Scripts run in the daemon process on a worker thread, one at a time. The watcher stays active. There is an interpreter operation limit to stop infinite script loops, but it does not impose a wall-clock timeout on native calls or child processes.
+Scripts run in the daemon process on a worker thread, one at a time. The watcher stays active. Each interpreter has an execution limit to stop infinite script loops, but it does not impose a wall-clock timeout on native calls or child processes. Lua exposes the base, string, table, math, and UTF-8 libraries, except for `load`, `loadfile`, `dofile`, `pcall`, and `xpcall`; protected calls are disabled so scripts cannot catch and ignore the instruction limit.
 
 **Scripts are trusted code, not sandboxed plugins.** The file and command functions operate with the daemon account's permissions. Keep both the module directory and the state directory under your control, and run as a dedicated unprivileged account by default. On Unix the state directory must have no group or other permissions (`chmod 700`); on Windows choose a private directory with appropriate ACLs.
 

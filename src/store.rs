@@ -104,7 +104,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::module::Module;
+    use crate::module::{Language, Module};
     use chrono::{DateTime, Utc};
 
     fn at(seconds: i64) -> DateTime<Utc> {
@@ -118,7 +118,7 @@ mod tests {
         let mut scan = Scan {
             modules: BTreeMap::from([(
                 "job.rhai".to_owned(),
-                Module::parse("// schedule: now".into(), at(100))?,
+                Module::parse("// schedule: now".into(), Language::Rhai, at(100))?,
             )]),
             ..Scan::default()
         };
@@ -133,7 +133,11 @@ mod tests {
         assert!(store.due(200, &scan)?.is_none());
         scan.modules.insert(
             "job.rhai".into(),
-            Module::parse("// schedule: now\n// edited".into(), at(200))?,
+            Module::parse(
+                "// schedule: now\n// edited".into(),
+                Language::Rhai,
+                at(200),
+            )?,
         );
         store.reconcile(&scan)?;
         let due = store.due(200, &scan)?.unwrap();
@@ -152,7 +156,7 @@ mod tests {
         let mut scan = Scan {
             modules: BTreeMap::from([(
                 "job.rhai".to_owned(),
-                Module::parse("// schedule: * * * * *".into(), at(1))?,
+                Module::parse("// schedule: * * * * *".into(), Language::Rhai, at(1))?,
             )]),
             ..Scan::default()
         };
@@ -162,7 +166,7 @@ mod tests {
         drop(store);
 
         let mut store = Store::open(&db, tmp.path())?;
-        let module = Module::parse("// schedule: * * * * *".into(), at(350))?;
+        let module = Module::parse("// schedule: * * * * *".into(), Language::Rhai, at(350))?;
         let next = module.schedule.next_after(at(350))?;
         scan.modules.insert("job.rhai".into(), module);
         store.reconcile(&scan)?;
@@ -183,7 +187,7 @@ mod tests {
         for name in ["completed.rhai", "pending.rhai"] {
             scan.modules.insert(
                 name.into(),
-                Module::parse("// schedule: now".into(), at(100))?,
+                Module::parse("// schedule: now".into(), Language::Rhai, at(100))?,
             );
         }
         store.reconcile(&scan)?;
@@ -194,7 +198,7 @@ mod tests {
         let healthy = Scan {
             modules: BTreeMap::from([(
                 "healthy.rhai".into(),
-                Module::parse("// schedule: now".into(), at(200))?,
+                Module::parse("// schedule: now".into(), Language::Rhai, at(200))?,
             )]),
             unreadable: scan.modules.keys().cloned().collect(),
             ..Scan::default()
