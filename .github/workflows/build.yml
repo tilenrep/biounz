@@ -1,0 +1,45 @@
+name: Native builds
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # GitHub does not use CODEOWNERS to authorize workflow dispatches.
+    if: >-
+      ${{ contains(format(',{0},', vars.NATIVE_BUILD_OWNERS), format(',{0},', github.actor)) &&
+          contains(format(',{0},', vars.NATIVE_BUILD_OWNERS), format(',{0},', github.triggering_actor)) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            binary: moduled
+          - os: macos-latest
+            binary: moduled
+          - os: windows-latest
+            binary: moduled.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable
+      - run: rustup default stable
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - name: Package binary and examples
+        shell: bash
+        env:
+          BINARY: ${{ matrix.binary }}
+          PACKAGE: moduled-${{ runner.os }}-${{ runner.arch }}
+        run: |
+          mkdir -p dist
+          cp "target/release/$BINARY" README.md dist/
+          cp -r examples dist/
+          tar -czf "$PACKAGE.tar.gz" -C dist .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moduled-${{ runner.os }}-${{ runner.arch }}
+          path: moduled-${{ runner.os }}-${{ runner.arch }}.tar.gz
