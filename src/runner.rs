@@ -345,6 +345,38 @@ mod tests {
     }
 
     #[test]
+    fn os_update_stops_if_apt_cannot_refresh_indexes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine(root.path(), MAX_OPERATIONS);
+        engine.register_fn("host_os", || "linux");
+        engine.register_fn("path_exists", |path: &str| -> ScriptResult<bool> {
+            Ok(matches!(path, "/etc/os-release" | "/usr/bin/apt-get"))
+        });
+        engine.register_fn("read_text", |_: &str| "ID=debian\n");
+        engine.register_fn(
+            "run_command",
+            |program: &str, args: Array| -> ScriptResult<rhai::INT> {
+                let args: Vec<_> = args.into_iter().map(|arg| arg.cast::<String>()).collect();
+                assert_eq!(program, "/usr/bin/apt-get");
+                assert_eq!(args, ["--error-on=any", "update"]);
+                Ok(100)
+            },
+        );
+        let source = include_str!("../examples/os-update.rhai").replacen(
+            "let apply_updates = false;",
+            "let apply_updates = true;",
+            1,
+        );
+        let error = engine.run(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("/usr/bin/apt-get exited with status 100")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn command_arguments_are_type_checked_before_launch() -> Result<()> {
         let root = tempfile::tempdir()?;
         let error = run(root.path(), "bad.rhai", "run_command(\"unused\", [1]);").unwrap_err();
