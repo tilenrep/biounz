@@ -25,7 +25,7 @@ for line in release.split("\n") {
 
 // Exact distribution IDs only; never guess from ID_LIKE or PATH.
 let plan = switch id {
-    "debian" | "ubuntu" => ["/usr/bin/apt-get", [["update"], ["upgrade", "-y"]]],
+    "debian" | "ubuntu" => ["/usr/bin/apt-get", [["--error-on=any", "update"], ["upgrade", "-y"]]],
     "fedora" => ["/usr/bin/dnf", [["upgrade", "--refresh", "-y"]]],
     "arch" | "cachyos" => ["/usr/bin/pacman", [["-Syu", "--noconfirm"]]],
     _ => throw "Unsupported or missing distribution ID: " + id,

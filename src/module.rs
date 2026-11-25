@@ -48,7 +48,10 @@ impl Schedule {
     fn parse(source: &str, language: Language) -> Result<Self> {
         let prefix = language.comment_prefix();
         let mut directive = None;
-        for line in source.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        let lines = source
+            .trim_start_matches('\u{feff}')
+            .split(|c| c == '\n' || (matches!(language, Language::Lua) && c == '\r'));
+        for line in lines.map(str::trim) {
             if line.is_empty() {
                 continue;
             }
@@ -80,6 +83,14 @@ impl Schedule {
                         "expected `now` or five cron fields: minute hour day-of-month month day-of-week"
                     );
                 };
+                // Croner discards empty list entries after stripping the weekday modifier.
+                let weekday_items = weekday.strip_prefix('+').unwrap_or(weekday);
+                ensure!(
+                    ![*minute, *hour, *day, *month, weekday_items]
+                        .iter()
+                        .any(|field| field.split(',').any(str::is_empty)),
+                    "invalid cron schedule: empty list entry"
+                );
                 // Cronie treats day fields starting with `*` as AND matches.
                 // Croner does this for a bare `*`, but needs `+` for stepped wildcards.
                 let weekday = if (day.starts_with('*') || weekday.starts_with('*'))
@@ -222,6 +233,9 @@ mod tests {
             "// schedule: now\n// schedule: * * * * *",
             "// schedule: 0 * * * * *",
             "// schedule: 61 * * * *",
+            "// schedule: 0,,30 * * * *",
+            "// schedule: 0 0 */2 * +,MON",
+            "// schedule: 0 0 * JAN, *",
             "// schedule: @daily",
         ] {
             assert!(
@@ -229,6 +243,7 @@ mod tests {
                 "accepted {text}"
             );
         }
+        assert!(Schedule::parse("// schedule: 0,30 * * * *", Language::Rhai).is_ok());
     }
 
     #[test]

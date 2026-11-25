@@ -93,7 +93,7 @@ fn lua_and_rhai_jobs_run_without_an_external_interpreter() -> Result<()> {
     fs::create_dir(&modules)?;
     fs::write(
         modules.join("job.lua"),
-        "-- schedule: now\nappend_text('../lua-output', 'lua\\n')",
+        "-- description\r-- schedule: now\rappend_text('../lua-output', 'lua\\n')\r",
     )?;
     deploy(&modules, "job.rhai", "rhai-output", "rhai")?;
     let mut daemon = Daemon::start(root.path())?;
