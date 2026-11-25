@@ -27,7 +27,7 @@ const TICK: Duration = Duration::from_millis(250);
 #[derive(Parser)]
 #[command(version, about)]
 struct Args {
-    /// Watch standalone Rhai (.rhai) scripts in this directory.
+    /// Watch standalone Rhai (.rhai) and Lua (.lua) scripts in this directory.
     #[arg(long, default_value = "modules")]
     modules: PathBuf,
 

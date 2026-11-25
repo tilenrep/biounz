@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
@@ -9,6 +8,29 @@ use chrono::{DateTime, Utc};
 use croner::Cron;
 
 const MAX_SOURCE_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy)]
+pub enum Language {
+    Rhai,
+    Lua,
+}
+
+impl Language {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()? {
+            "rhai" => Some(Self::Rhai),
+            "lua" => Some(Self::Lua),
+            _ => None,
+        }
+    }
+
+    fn comment_prefix(self) -> &'static str {
+        match self {
+            Self::Rhai => "//",
+            Self::Lua => "--",
+        }
+    }
+}
 
 pub struct Module {
     pub source: String,
@@ -23,22 +45,36 @@ pub enum Schedule {
 }
 
 impl Schedule {
-    fn parse(source: &str) -> Result<Self> {
+    fn parse(source: &str, language: Language) -> Result<Self> {
+        let prefix = language.comment_prefix();
         let mut directive = None;
-        for line in source.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        let lines = source
+            .trim_start_matches('\u{feff}')
+            .split(|c| c == '\n' || (matches!(language, Language::Lua) && c == '\r'));
+        for line in lines.map(str::trim) {
             if line.is_empty() {
                 continue;
             }
-            let Some(comment) = line.strip_prefix("//") else {
+            let Some(comment) = line.strip_prefix(prefix) else {
                 break;
             };
+            // A Lua long comment ends the opening block of line comments.
+            if matches!(language, Language::Lua)
+                && comment
+                    .strip_prefix('[')
+                    .is_some_and(|tail| tail.trim_start_matches('=').starts_with('['))
+            {
+                break;
+            }
             if let Some(value) = comment.trim_start().strip_prefix("schedule:") {
                 ensure!(directive.is_none(), "multiple schedule directives");
                 directive = Some(value.trim());
             }
         }
 
-        match directive.context("missing `// schedule: ...` in the file header")? {
+        match directive
+            .with_context(|| format!("missing `{prefix} schedule: ...` in the file header"))?
+        {
             "now" => Ok(Self::Now),
             expression => {
                 let fields: Vec<_> = expression.split_whitespace().collect();
@@ -47,6 +83,14 @@ impl Schedule {
                         "expected `now` or five cron fields: minute hour day-of-month month day-of-week"
                     );
                 };
+                // Croner discards empty list entries after stripping the weekday modifier.
+                let weekday_items = weekday.strip_prefix('+').unwrap_or(weekday);
+                ensure!(
+                    ![*minute, *hour, *day, *month, weekday_items]
+                        .iter()
+                        .any(|field| field.split(',').any(str::is_empty)),
+                    "invalid cron schedule: empty list entry"
+                );
                 // Cronie treats day fields starting with `*` as AND matches.
                 // Croner does this for a bare `*`, but needs `+` for stepped wildcards.
                 let weekday = if (day.starts_with('*') || weekday.starts_with('*'))
@@ -88,8 +132,8 @@ impl Schedule {
 }
 
 impl Module {
-    pub fn parse(source: String, now: DateTime<Utc>) -> Result<Self> {
-        let schedule = Schedule::parse(&source)?;
+    pub fn parse(source: String, language: Language, now: DateTime<Utc>) -> Result<Self> {
+        let schedule = Schedule::parse(&source, language)?;
         let first_at = schedule.next_after(now)?.unwrap_or_else(|| now.timestamp());
         let digest = blake3::hash(source.as_bytes()).to_hex().to_string();
         Ok(Self {
@@ -119,7 +163,10 @@ pub fn scan(directory: &Path, now: DateTime<Utc>) -> Result<Scan> {
     for entry in entries {
         let entry = entry.context("read module directory entry")?;
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("rhai")) || !entry.file_type()?.is_file() {
+        let Some(language) = Language::from_path(&path) else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
             continue;
         }
         let filename = entry.file_name();
@@ -141,7 +188,7 @@ pub fn scan(directory: &Path, now: DateTime<Utc>) -> Result<Scan> {
                 continue;
             }
         };
-        match source.and_then(|result| Module::parse(result, now)) {
+        match source.and_then(|result| Module::parse(result, language, now)) {
             Ok(module) => {
                 scan.modules.insert(name.into(), module);
             }
@@ -174,8 +221,11 @@ mod tests {
     #[test]
     fn validates_metadata() {
         assert!(matches!(
-            Schedule::parse("\u{feff}// description\r\n// schedule: now\r\nfn main() {}\r\n")
-                .unwrap(),
+            Schedule::parse(
+                "\u{feff}// description\r\n// schedule: now\r\nfn main() {}\r\n",
+                Language::Rhai
+            )
+            .unwrap(),
             Schedule::Now
         ));
         for text in [
@@ -183,16 +233,46 @@ mod tests {
             "// schedule: now\n// schedule: * * * * *",
             "// schedule: 0 * * * * *",
             "// schedule: 61 * * * *",
+            "// schedule: 0,,30 * * * *",
+            "// schedule: 0 0 */2 * +,MON",
+            "// schedule: 0 0 * JAN, *",
             "// schedule: @daily",
         ] {
-            assert!(Schedule::parse(text).is_err(), "accepted {text}");
+            assert!(
+                Schedule::parse(text, Language::Rhai).is_err(),
+                "accepted {text}"
+            );
+        }
+        assert!(Schedule::parse("// schedule: 0,30 * * * *", Language::Rhai).is_ok());
+    }
+
+    #[test]
+    fn lua_schedules_use_opening_line_comments() {
+        assert!(matches!(
+            Schedule::parse(
+                "\u{feff}-- description\r\n-- schedule: now\r\nprint(42)\r\n",
+                Language::Lua
+            )
+            .unwrap(),
+            Schedule::Now
+        ));
+        for text in [
+            "// schedule: now",
+            "print(42)\n-- schedule: now",
+            "--[=[\n-- schedule: now\n]=]",
+            "-- schedule: now\n-- schedule: now",
+        ] {
+            assert!(
+                Schedule::parse(text, Language::Lua).is_err(),
+                "accepted {text}"
+            );
         }
     }
 
     #[test]
     fn cron_uses_utc_and_excludes_current_instant() {
         let monday = Utc.with_ymd_and_hms(2026, 1, 5, 2, 30, 0).unwrap();
-        let schedule = Schedule::parse("// schedule: 30 2 * * MON").unwrap();
+        let schedule = Schedule::parse("-- schedule: 30 2 * * MON", Language::Lua).unwrap();
         assert_eq!(
             schedule.next_after(monday).unwrap(),
             Some(monday.timestamp() + 7 * 86400)
@@ -209,7 +289,8 @@ mod tests {
             ("0 0 7 * MON", 7),
         ] {
             let expected = Utc.with_ymd_and_hms(2026, 1, day, 0, 0, 0).unwrap();
-            let schedule = Schedule::parse(&format!("// schedule: {expression}")).unwrap();
+            let schedule =
+                Schedule::parse(&format!("// schedule: {expression}"), Language::Rhai).unwrap();
             assert_eq!(
                 schedule.next_after(start).unwrap(),
                 Some(expected.timestamp()),
@@ -218,7 +299,7 @@ mod tests {
             assert!(schedule.matches_timestamp(expected.timestamp()).unwrap());
         }
         let stale = Utc.with_ymd_and_hms(2026, 1, 7, 0, 0, 0).unwrap();
-        let schedule = Schedule::parse("// schedule: 0 0 */2 * MON").unwrap();
+        let schedule = Schedule::parse("// schedule: 0 0 */2 * MON", Language::Rhai).unwrap();
         assert!(!schedule.matches_timestamp(stale.timestamp()).unwrap());
     }
 
@@ -226,6 +307,8 @@ mod tests {
     fn scan_only_accepts_regular_script_modules() -> Result<()> {
         let dir = tempfile::tempdir()?;
         fs::write(dir.path().join("good.rhai"), "// schedule: now\nprint(42);")?;
+        fs::write(dir.path().join("good.lua"), "-- schedule: now\nprint(42)")?;
+        fs::write(dir.path().join("bad.lua"), "// schedule: now\nprint(42)")?;
         fs::write(dir.path().join("bad.rhai"), "print(42);")?;
         fs::write(dir.path().join(".partial.rhai"), "// schedule: now")?;
         fs::write(dir.path().join("legacy.rs"), "// schedule: now")?;
@@ -239,11 +322,11 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["good.rhai"]
+            ["good.lua", "good.rhai"]
         );
         assert_eq!(
             result.errors.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["bad.rhai"]
+            ["bad.lua", "bad.rhai"]
         );
         Ok(())
     }

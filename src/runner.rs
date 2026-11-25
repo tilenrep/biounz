@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -5,15 +7,29 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
+use mlua::chunk::ChunkMode;
+use mlua::{HookTriggers, Lua, LuaOptions, StdLib, Value, VmState};
 use rhai::{Array, Engine, EvalAltResult, ImmutableString, Position};
+
+use crate::module::Language;
 
 type ScriptResult<T> = Result<T, Box<EvalAltResult>>;
 const MAX_OPERATIONS: u64 = 1_000_000;
 
 pub fn run(directory: &Path, name: &str, source: &str) -> Result<()> {
+    let source = source.trim_start_matches('\u{feff}');
+    match Language::from_path(Path::new(name)).context("unsupported script extension")? {
+        Language::Rhai => run_rhai(directory, name, source),
+        Language::Lua => {
+            run_lua(directory, name, source).map_err(|err| anyhow::anyhow!("script error: {err}"))
+        }
+    }
+}
+
+fn run_rhai(directory: &Path, name: &str, source: &str) -> Result<()> {
     let engine = engine(directory, MAX_OPERATIONS);
     let mut script = engine
-        .compile(source.trim_start_matches('\u{feff}'))
+        .compile(source)
         .map_err(|err| anyhow::anyhow!("script syntax: {err}"))?;
     script.set_source(name);
     engine
@@ -42,11 +58,7 @@ fn engine(directory: &Path, max_operations: u64) -> Engine {
     engine.register_fn(
         "append_text",
         move |path: &str, text: &str| -> ScriptResult<()> {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join(path))
-                .and_then(|mut file| file.write_all(text.as_bytes()))
+            append_text(&root.join(path), text.as_bytes())
                 .map_err(|err| script_error(format!("append to {path:?}: {err}")))
         },
     );
@@ -54,30 +66,131 @@ fn engine(directory: &Path, max_operations: u64) -> Engine {
     engine.register_fn(
         "run_command",
         move |program: &str, args: Array| -> ScriptResult<rhai::INT> {
-            command(&root, program, args).map_err(|err| script_error(format!("{err:#}")))
+            let args = args
+                .into_iter()
+                .map(|arg| {
+                    arg.try_cast::<ImmutableString>()
+                        .ok_or_else(|| script_error("run_command arguments must be strings".into()))
+                })
+                .collect::<ScriptResult<Vec<_>>>()?;
+            command(&root, program, args.iter().map(|arg| arg.as_str()))
+                .map(rhai::INT::from)
+                .map_err(|err| script_error(format!("{err:#}")))
         },
     );
     engine
 }
 
-fn command(directory: &Path, program: &str, args: Array) -> Result<rhai::INT> {
+fn run_lua(directory: &Path, name: &str, source: &str) -> mlua::Result<()> {
+    let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
+    let lua = Lua::new_with(libraries, LuaOptions::default())?;
+    let globals = lua.globals();
+    // Scripts use only the module source. A Lua protected call could catch the hook error.
+    for name in ["load", "loadfile", "dofile", "pcall", "xpcall"] {
+        globals.set(name, Value::Nil)?;
+    }
+    const HOOK_INTERVAL: u32 = 1_000;
+    let remaining = Cell::new(MAX_OPERATIONS / u64::from(HOOK_INTERVAL));
+    lua.set_hook(
+        HookTriggers::new().every_nth_instruction(HOOK_INTERVAL),
+        move |_, _| {
+            let ticks = remaining.get().saturating_sub(1);
+            remaining.set(ticks);
+            if ticks == 0 {
+                Err(mlua::Error::runtime("Lua instruction limit exceeded"))
+            } else {
+                Ok(VmState::Continue)
+            }
+        },
+    )?;
+    globals.set(
+        "host_os",
+        lua.create_function(|_, ()| Ok(std::env::consts::OS))?,
+    )?;
+    globals.set(
+        "host_arch",
+        lua.create_function(|_, ()| Ok(std::env::consts::ARCH))?,
+    )?;
+
+    let root = directory.to_path_buf();
+    globals.set(
+        "path_exists",
+        lua.create_function(move |_, path: String| {
+            root.join(&path)
+                .try_exists()
+                .map_err(|err| mlua::Error::runtime(format!("check {path:?}: {err}")))
+        })?,
+    )?;
+    let root = directory.to_path_buf();
+    globals.set(
+        "read_text",
+        lua.create_function(move |_, path: String| {
+            fs::read_to_string(root.join(&path))
+                .map_err(|err| mlua::Error::runtime(format!("read {path:?}: {err}")))
+        })?,
+    )?;
+    let root = directory.to_path_buf();
+    globals.set(
+        "append_text",
+        lua.create_function(move |_, (path, text): (String, String)| {
+            append_text(&root.join(&path), text.as_bytes())
+                .map_err(|err| mlua::Error::runtime(format!("append to {path:?}: {err}")))
+        })?,
+    )?;
+    let root = directory.to_path_buf();
+    globals.set(
+        "run_command",
+        lua.create_function(move |_, (program, args): (String, mlua::Table)| {
+            let args = lua_command_args(args)?;
+            command(&root, &program, args.values().map(String::as_str))
+                .map_err(|err| mlua::Error::runtime(format!("{err:#}")))
+        })?,
+    )?;
+
+    lua.load(source)
+        .set_name(name)
+        .set_mode(ChunkMode::Text)
+        .exec()
+}
+
+fn lua_command_args(table: mlua::Table) -> mlua::Result<BTreeMap<mlua::Integer, String>> {
+    let invalid = || mlua::Error::runtime("run_command arguments must be a list of strings");
+    let mut args = BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (Value::Integer(index), Value::String(arg)) = pair? else {
+            return Err(invalid());
+        };
+        args.insert(index, arg.to_str()?.to_string());
+    }
+    if !args.keys().copied().eq((1..).take(args.len())) {
+        return Err(invalid());
+    }
+    Ok(args)
+}
+
+fn append_text(path: &Path, text: &[u8]) -> std::io::Result<()> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?
+        .write_all(text)
+}
+
+fn command<'a>(
+    directory: &Path,
+    program: &str,
+    args: impl IntoIterator<Item = &'a str>,
+) -> Result<i32> {
     let path = Path::new(program);
     anyhow::ensure!(
         path.is_absolute() || path.file_name() == Some(OsStr::new(program)),
         "use an absolute executable path or a bare name on PATH"
     );
-    let argv = args
-        .into_iter()
-        .map(|arg| {
-            arg.try_cast::<ImmutableString>()
-                .context("run_command arguments must be strings")
-        })
-        .collect::<Result<Vec<_>>>()?;
     let mut command = Command::new(program);
     command
         .current_dir(directory)
         .stdin(Stdio::null())
-        .args(argv.iter().map(|s| s.as_str()));
+        .args(args);
     // The daemon handles terminal Ctrl-C and waits for any active job.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
@@ -88,7 +201,6 @@ fn command(directory: &Path, program: &str, args: Array) -> Result<rhai::INT> {
         .with_context(|| format!("start {program:?}"))?;
     status
         .code()
-        .map(rhai::INT::from)
         .with_context(|| format!("{program:?} terminated without an exit code: {status}"))
 }
 
@@ -127,6 +239,60 @@ mod tests {
             .run("let x = 0; loop { x += 1; }")
             .unwrap_err();
         assert!(matches!(*error, EvalAltResult::ErrorTooManyOperations(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn lua_host_helpers_use_module_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        run(
+            root.path(),
+            "test.lua",
+            "\u{feff}assert(not path_exists('output'))\n\
+             append_text('output', host_os() .. '/' .. host_arch())\n\
+             assert(path_exists('output'))\n\
+             assert(read_text('output') == host_os() .. '/' .. host_arch())",
+        )?;
+        assert_eq!(
+            fs::read_to_string(root.path().join("output"))?,
+            format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH)
+        );
+        run(
+            root.path(),
+            "hello.lua",
+            include_str!("../examples/hello.lua"),
+        )
+    }
+
+    #[test]
+    fn lua_stops_infinite_scripts() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let error = run(
+            root.path(),
+            "loop.lua",
+            "assert(pcall == nil and xpcall == nil and coroutine == nil)\nwhile true do end",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Lua instruction limit exceeded"));
+        Ok(())
+    }
+
+    #[test]
+    fn lua_validates_command_arguments_before_launch() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        for args in ["{1}", "{[2] = 'gap'}", "{name = 'value'}"] {
+            let error = run(
+                root.path(),
+                "bad.lua",
+                &format!("run_command('unused', {args})"),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("arguments must be a list of strings")
+            );
+        }
         Ok(())
     }
 
@@ -174,6 +340,38 @@ mod tests {
                 "Detected cachyos; apply updates: false",
                 "/usr/bin/pacman -Syu --noconfirm"
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn os_update_stops_if_apt_cannot_refresh_indexes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = engine(root.path(), MAX_OPERATIONS);
+        engine.register_fn("host_os", || "linux");
+        engine.register_fn("path_exists", |path: &str| -> ScriptResult<bool> {
+            Ok(matches!(path, "/etc/os-release" | "/usr/bin/apt-get"))
+        });
+        engine.register_fn("read_text", |_: &str| "ID=debian\n");
+        engine.register_fn(
+            "run_command",
+            |program: &str, args: Array| -> ScriptResult<rhai::INT> {
+                let args: Vec<_> = args.into_iter().map(|arg| arg.cast::<String>()).collect();
+                assert_eq!(program, "/usr/bin/apt-get");
+                assert_eq!(args, ["--error-on=any", "update"]);
+                Ok(100)
+            },
+        );
+        let source = include_str!("../examples/os-update.rhai").replacen(
+            "let apply_updates = false;",
+            "let apply_updates = true;",
+            1,
+        );
+        let error = engine.run(&source).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("/usr/bin/apt-get exited with status 100")
         );
         Ok(())
     }

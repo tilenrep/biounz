@@ -87,6 +87,22 @@ fn deploy(modules: &Path, name: &str, output: &str, line: &str) -> Result<()> {
 }
 
 #[test]
+fn lua_and_rhai_jobs_run_without_an_external_interpreter() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let modules = root.path().join("modules");
+    fs::create_dir(&modules)?;
+    fs::write(
+        modules.join("job.lua"),
+        "-- description\r-- schedule: now\rappend_text('../lua-output', 'lua\\n')\r",
+    )?;
+    deploy(&modules, "job.rhai", "rhai-output", "rhai")?;
+    let mut daemon = Daemon::start(root.path())?;
+    daemon.wait_for(&root.path().join("lua-output"), "lua\n")?;
+    daemon.wait_for(&root.path().join("rhai-output"), "rhai\n")?;
+    daemon.stop()
+}
+
+#[test]
 fn added_and_edited_modules_run_but_an_unchanged_module_stays_consumed() -> Result<()> {
     let root = tempfile::tempdir()?;
     let modules = root.path().join("modules");
