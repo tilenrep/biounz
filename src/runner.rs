@@ -115,7 +115,8 @@ fn run_lua(directory: &Path, name: &str, source: &str) -> mlua::Result<()> {
     let root = directory.to_path_buf();
     globals.set(
         "path_exists",
-        lua.create_function(move |_, path: String| {
+        lua.create_function(move |_, path: Value| {
+            let path = lua_file_path(path)?;
             root.join(&path)
                 .try_exists()
                 .map_err(|err| mlua::Error::runtime(format!("check {path:?}: {err}")))
@@ -124,7 +125,8 @@ fn run_lua(directory: &Path, name: &str, source: &str) -> mlua::Result<()> {
     let root = directory.to_path_buf();
     globals.set(
         "read_text",
-        lua.create_function(move |_, path: String| {
+        lua.create_function(move |_, path: Value| {
+            let path = lua_file_path(path)?;
             fs::read_to_string(root.join(&path))
                 .map_err(|err| mlua::Error::runtime(format!("read {path:?}: {err}")))
         })?,
@@ -132,7 +134,8 @@ fn run_lua(directory: &Path, name: &str, source: &str) -> mlua::Result<()> {
     let root = directory.to_path_buf();
     globals.set(
         "append_text",
-        lua.create_function(move |_, (path, text): (String, String)| {
+        lua.create_function(move |_, (path, text): (Value, String)| {
+            let path = lua_file_path(path)?;
             append_text(&root.join(&path), text.as_bytes())
                 .map_err(|err| mlua::Error::runtime(format!("append to {path:?}: {err}")))
         })?,
@@ -151,6 +154,13 @@ fn run_lua(directory: &Path, name: &str, source: &str) -> mlua::Result<()> {
         .set_name(name)
         .set_mode(ChunkMode::Text)
         .exec()
+}
+
+fn lua_file_path(path: Value) -> mlua::Result<String> {
+    let Value::String(path) = path else {
+        return Err(mlua::Error::runtime("file path must be a string"));
+    };
+    Ok(path.to_str()?.to_owned())
 }
 
 fn lua_command_args(table: mlua::Table) -> mlua::Result<BTreeMap<mlua::Integer, String>> {
@@ -262,6 +272,29 @@ mod tests {
             "hello.lua",
             include_str!("../examples/hello.lua"),
         )
+    }
+
+    #[test]
+    fn lua_file_helpers_reject_numeric_paths() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        run(
+            root.path(),
+            "test.lua",
+            "append_text('123', 'original'); assert(path_exists('123')); assert(read_text('123') == 'original')",
+        )?;
+        for source in [
+            "path_exists(123)",
+            "read_text(123)",
+            "append_text(123, 'extra')",
+        ] {
+            let error = run(root.path(), "test.lua", source).unwrap_err();
+            assert!(
+                error.to_string().contains("file path must be a string"),
+                "{source}: {error}"
+            );
+        }
+        assert_eq!(fs::read_to_string(root.path().join("123"))?, "original");
+        Ok(())
     }
 
     #[test]
